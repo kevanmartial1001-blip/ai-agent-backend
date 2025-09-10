@@ -1,4 +1,4 @@
-export const config = { runtime: 'edge' };
+export const config = { runtime: 'nodejs18.x' };
 
 const KB_BASE = () => process.env.KB_BASE;
 const KB_TOKEN = () => process.env.KB_TOKEN;
