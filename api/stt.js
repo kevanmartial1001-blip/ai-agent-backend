@@ -15,25 +15,43 @@ function corsHeaders(req) {
   };
 }
 
+// ---- Deepgram (realtime HTTP) ----
 async function sttDeepgram(blob, type, lang) {
-  const params = new URLSearchParams({
-    model: 'nova-2-general',
+  // modèle robuste et reconnu: "nova-2"
+  const qs = new URLSearchParams({
+    model: 'nova-2',
     smart_format: 'true',
     punctuate: 'true',
-    detect_language: lang ? 'false' : 'true'
+    ...(lang ? { language: lang, detect_language: 'false' } : { detect_language: 'true' })
   }).toString();
-  const url = `https://api.deepgram.com/v1/listen?${params}`;
+  const url = `https://api.deepgram.com/v1/listen?${qs}`;
   const r = await fetch(url, {
     method: 'POST',
-    headers: { Authorization: 'Token ' + process.env.DEEPGRAM_API_KEY, 'Content-Type': type || 'application/octet-stream' },
+    headers: {
+      Authorization: 'Token ' + process.env.DEEPGRAM_API_KEY,
+      'Content-Type': type || 'application/octet-stream'
+    },
     body: blob
   });
-  const t = await r.text(); let d = {}; try { d = JSON.parse(t); } catch {}
-  if (!r.ok) throw new Error(d?.error || t || `HTTP ${r.status}`);
+  const t = await r.text();
+  let d = {};
+  try { d = JSON.parse(t); } catch {}
+  if (!r.ok) {
+    const msg = d?.error || d?.message || t || `HTTP ${r.status}`;
+    const err = new Error(msg);
+    err.status = r.status;
+    throw err;
+  }
   const alt = d?.results?.channels?.[0]?.alternatives?.[0];
-  return { ok: true, text: alt?.transcript || '', language: (alt?.language || '').toLowerCase() };
+  return {
+    ok: true,
+    provider: 'deepgram',
+    text: alt?.transcript || '',
+    language: (alt?.language || '').toLowerCase()
+  };
 }
 
+// ---- OpenAI Whisper (secours) ----
 async function sttWhisper(blob, type, lang) {
   const fd = new FormData();
   fd.append('model', 'whisper-1');
@@ -45,9 +63,16 @@ async function sttWhisper(blob, type, lang) {
     headers: { authorization: 'Bearer ' + process.env.OPENAI_API_KEY },
     body: fd
   });
-  const t = await r.text(); let d = {}; try { d = JSON.parse(t); } catch {}
-  if (!r.ok) throw new Error(d?.error?.message || t || `HTTP ${r.status}`);
-  return { ok: true, text: d.text || '', language: (d.language || '').toLowerCase() };
+  const t = await r.text();
+  let d = {};
+  try { d = JSON.parse(t); } catch {}
+  if (!r.ok) {
+    const msg = d?.error?.message || t || `HTTP ${r.status}`;
+    const err = new Error(msg);
+    err.status = r.status;
+    throw err;
+  }
+  return { ok: true, provider: 'whisper', text: d.text || '', language: (d.language || '').toLowerCase() };
 }
 
 export default async function handler(req) {
@@ -62,25 +87,39 @@ export default async function handler(req) {
     const type = mime || 'audio/mp4';
     const blob = new Blob([bytes], { type });
 
-    const provider = (process.env.STT_PROVIDER || 'openai').toLowerCase();
-    // 1) Essaye Deepgram si demandé
-    if (provider === 'deepgram') {
-      try {
-        const r = await sttDeepgram(blob, type, lang);
-        if (r && r.ok && r.text) return json(r, 200, CORS);
-        // si pas de texte, on tente Whisper
-      } catch (e) {
-        // fallback Whisper
+    const want = (process.env.STT_PROVIDER || 'openai').toLowerCase();
+
+    // 1) Deepgram prioritaire
+    if (want === 'deepgram') {
+      if (!process.env.DEEPGRAM_API_KEY) {
+        // clé absente -> on n’essaie même pas Deepgram
+        try {
+          const r2 = await sttWhisper(blob, type, lang);
+          return json({ ...r2, fallback: 'missing_deepgram_key' }, 200, CORS);
+        } catch (e2) {
+          return json({ ok: false, error: String(e2?.message || e2), provider: 'whisper' }, e2?.status || 502, CORS);
+        }
       }
       try {
-        const r2 = await sttWhisper(blob, type, lang);
-        return json(r2, 200, CORS);
-      } catch (e2) {
-        return json({ ok: false, error: String(e2?.message || e2) }, 502, CORS);
+        const r = await sttDeepgram(blob, type, lang);
+        return json(r, 200, CORS);
+      } catch (e) {
+        // Deepgram a échoué -> tente Whisper
+        try {
+          const r2 = await sttWhisper(blob, type, lang);
+          return json({ ...r2, fallback: 'deepgram_error', deepgram_error: String(e?.message || e) }, 200, CORS);
+        } catch (e2) {
+          return json({
+            ok: false,
+            error: String(e2?.message || e2),
+            provider: 'whisper',
+            deepgram_error: String(e?.message || e)
+          }, e2?.status || 502, CORS);
+        }
       }
     }
 
-    // 2) Par défaut: Whisper
+    // 2) Par défaut: Whisper seul
     const r = await sttWhisper(blob, type, lang);
     return json(r, 200, CORS);
   } catch (e) {
