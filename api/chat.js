@@ -1,4 +1,4 @@
-// api/chat.js  — Node.js serverless version (with CORS + fallbacks)
+// api/chat.js  — Node.js serverless (CORS + fallbacks + "local-" sessions)
 export const config = { runtime: 'nodejs' };
 
 const HG = 'https://api.heygen.com/v1';
@@ -25,7 +25,6 @@ function sendJson(res, data, status = 200, extraHeaders = {}) {
 }
 
 async function parseBody(req) {
-  // Vercel often gives JSON-parsed body already. If not, read the raw buffer.
   if (req.body && typeof req.body === 'object') return req.body;
   const chunks = [];
   for await (const c of req) chunks.push(c);
@@ -74,7 +73,7 @@ const MINI_PROMPT = [
 // ---- OpenAI call with timeout ----
 async function llmReply(messages) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 12000); // 12s
+  const timer = setTimeout(() => controller.abort(), 12000);
   try {
     const r = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
@@ -102,7 +101,6 @@ function fallbackReply(userText) {
 export default async function handler(req, res) {
   const CORS = getCorsHeaders(req);
 
-  // 1) Handle preflight
   if (req.method === 'OPTIONS') {
     res.statusCode = 204;
     for (const [k, v] of Object.entries(CORS)) res.setHeader(k, v);
@@ -110,17 +108,19 @@ export default async function handler(req, res) {
   }
 
   try {
-    // 2) Parse body
     const body = await parseBody(req);
-    const { session_id, visitor_id, text, lang } = body || {};
-    if (!session_id || !text) return sendJson(res, { ok: false, error: 'missing params' }, 400, CORS);
+    let { session_id, visitor_id, text, lang } = body || {};
+    if (!text) return sendJson(res, { ok: false, error: 'missing text' }, 400, CORS);
 
-    // 3) Log user turn
+    // Autoriser les "sessions locales" (fallback audio-only)
+    if (!session_id) session_id = 'local-' + Math.random().toString(36).slice(2);
+    const isLocal = String(session_id).startsWith('local-');
+
+    // Log user turn
     await kbPost('logturn', { session_id, visitor_id, role: 'user', text, lang: lang || '' });
 
-    // 4) Fetch short history + compact KB pack
+    // KB pack minimal + historique court
     let inferredIndustry = 'universal_business', roleLevel = 'unknown', country = '', subregion = '';
-
     const history = await kbGet('history', { session_id, limit: '8' });
     const [industry, persona, geo, scenarios] = await Promise.all([
       kbGet('industry', { industry_id: inferredIndustry }),
@@ -153,39 +153,36 @@ export default async function handler(req, res) {
       { role: 'user', content: String(text) }
     ];
 
-    // 5) LLM
+    // LLM
     const llm = await llmReply(messages);
     let reply = '';
     if (llm.ok) {
-      // Expect JSON string or plain text
-      try {
-        const parsed = JSON.parse(llm.content);
-        reply = String(parsed?.reply || '');
-      } catch {
-        reply = String(llm.content || '');
-      }
+      try { const parsed = JSON.parse(llm.content); reply = String(parsed?.reply || ''); }
+      catch { reply = String(llm.content || ''); }
     } else {
       reply = fallbackReply(text);
     }
     if (!reply) reply = fallbackReply(text);
 
-    // 6) Log assistant + speak via HeyGen
+    // Log assistant
     await kbPost('logturn', { session_id, visitor_id, role: 'assistant', text: reply, lang: lang || '' });
-    await heygenSay(session_id, reply);
 
-    // 7) Respond
-    return sendJson(res, { ok: true, reply, source: llm.ok ? 'openai' : 'fallback', error: llm.ok ? undefined : llm.error }, 200, CORS);
+    // Parler uniquement si ce n'est pas une session locale
+    if (!isLocal) await heygenSay(session_id, reply);
+
+    return sendJson(res, { ok: true, reply, source: llm.ok ? 'openai' : 'fallback', isLocal }, 200, CORS);
 
   } catch (e) {
-    // Hard fallback: still speak something so user never gets silence
+    // Hard fallback
     try {
       const body = await parseBody(req);
-      if (body?.session_id) {
-        const msg = fallbackReply(body?.text || '');
-        await heygenSay(body.session_id, msg);
-        return sendJson(res, { ok: true, reply: msg, source: 'hard-fallback', error: String(e?.message || e) }, 200, CORS);
-      }
-    } catch {}
-    return sendJson(res, { ok: false, error: String(e?.message || e) }, 500, CORS);
+      const sid = body?.session_id || ('local-' + Math.random().toString(36).slice(2));
+      const msg = fallbackReply(body?.text || '');
+      // pas d'appel HeyGen si local
+      await kbPost('logturn', { session_id: sid, visitor_id: body?.visitor_id, role: 'assistant', text: msg, lang: body?.lang || '' });
+      return sendJson(res, { ok: true, reply: msg, source: 'hard-fallback', isLocal: true, error: String(e?.message || e) }, 200, CORS);
+    } catch {
+      return sendJson(res, { ok: false, error: String(e?.message || e) }, 500, CORS);
+    }
   }
 }
