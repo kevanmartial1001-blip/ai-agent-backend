@@ -1,5 +1,3 @@
-// app/api/heygen-sdk/route.ts
-// Proxy du SDK ESM HeyGen via TON domaine (évite le blocage CSP sur Shopify)
 export const runtime = "nodejs";
 export const dynamic = "force-static";
 
