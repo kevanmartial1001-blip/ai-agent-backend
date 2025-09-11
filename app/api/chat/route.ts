@@ -1,5 +1,6 @@
 // File: app/api/chat/route.ts
-// pnpm add openai ai  (ou npm/yarn)
+// Runtime: Vercel Edge
+// Deps: pnpm add openai ai
 // ENV: OPENAI_API_KEY, KB_SHEETS_URL, KB_TOKEN, (opt) LANG_DEFAULT
 
 import { OpenAI } from 'openai';
@@ -18,7 +19,7 @@ type KBScenario = {
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
 
-// ---------- KB fetchers (Apps Script) ----------
+/* ---------------- KB fetchers (Apps Script) ---------------- */
 async function kbGET(params: Record<string,string>): Promise<any> {
   const url = new URL(process.env.KB_SHEETS_URL!);
   url.searchParams.set('token', process.env.KB_TOKEN!);
@@ -38,11 +39,11 @@ const kbSearchScenarios = (industry_id: string, q: string, limit=6) => kbGET({
   fn: 'search_scenarios', industry_id, q, limit: String(limit)
 }) as Promise<{ snippets: KBScenario[] }>;
 
-// ---------- helpers ----------
+/* ---------------- helpers ---------------- */
 function guessLocaleFromText(t?: string) {
   if (!t) return process.env.LANG_DEFAULT || 'en';
   const s = t.toLowerCase();
-  if (/[àâçéèêëîïôùûüÿœ]/.test(s) || /bonjour|merci|industrie|parfait/.test(s)) return 'fr';
+  if (/[àâçéèêëîïôùûüÿœ]/.test(s) || /bonjour|merci|industrie|parfait|poste|localisation/.test(s)) return 'fr';
   if (/[áéíóúñü]/.test(s) || /hola|gracias|industria/.test(s)) return 'es';
   return process.env.LANG_DEFAULT || 'en';
 }
@@ -57,29 +58,45 @@ function normalizeRoleLevel(text?: string): string|undefined {
 }
 function classifyAIExperience(text?: string) {
   const s = (text||'').toLowerCase();
-  if (/(first time|new to ai|just exploring|no idea|beginner|not familiar)/.test(s)) return 'newcomer';
-  if (/(daily|every day|we use|already using|advanced|expert|fine-tuning|agents)/.test(s)) return 'advanced';
+  if (/(first time|new to ai|just exploring|no idea|beginner|not familiar|découverte|débutant)/.test(s)) return 'newcomer';
+  if (/(daily|every day|we use|already using|advanced|expert|fine-tuning|agents|quotidiennement|déjà|avancé)/.test(s)) return 'advanced';
   return 'intermediate';
 }
 function deriveIntentKeywords(text?: string) {
   const s = (text||'').toLowerCase();
   const keys: string[] = ['automation','workflow','intake'];
-  if (/sales|leads|crm|pipeline/.test(s)) keys.push('sales','leads','crm');
-  if (/ops|operations|fulfillment|wms|logistics|inventory/.test(s)) keys.push('ops','wms','logistics','inventory');
-  if (/support|tickets|zendesk|helpdesk|service/.test(s)) keys.push('support','tickets','service');
-  if (/finance|invoice|billing|ap|ar|collections/.test(s)) keys.push('finance','invoice','billing','ap','ar','collections');
+  if (/sales|leads|crm|pipeline|vente|prospect/.test(s)) keys.push('sales','leads','crm');
+  if (/ops|operations|fulfillment|wms|logistics|inventory|logistique|inventaire/.test(s)) keys.push('ops','wms','logistics','inventory');
+  if (/support|tickets|zendesk|helpdesk|service|sav/.test(s)) keys.push('support','tickets','service');
+  if (/finance|invoice|billing|ap|ar|collections|facture|compta/.test(s)) keys.push('finance','invoice','billing','ap','ar','collections');
   return Array.from(new Set(keys)).join(',');
 }
-function hasStep1Minimum(state:any) {
-  return !!(state?.industry?.industry_id && state?.role_level && state?.geo_country);
+function hasStep1Minimum(x:any) {
+  return !!(x?.industry?.industry_id && x?.role_level && x?.geo_country);
 }
 function trunc(s: string, n=160) {
   if (!s) return '';
   const t = s.trim().replace(/\s+/g,' ');
   return t.length > n ? t.slice(0, n-1) + '…' : t;
 }
+function positiveSignalScore(text?: string) {
+  const s = (text||'').toLowerCase();
+  const hits = [
+    'yes','ok','sure','go ahead','proceed','interested','let’s do it','let us do it','sounds good','sounds great',
+    'amazing','impressed','show me','demo','on board','partant','intéressé','ça me va','parfait','allons-y','go'
+  ];
+  return hits.reduce((acc,h)=> acc + (s.includes(h) ? 1 : 0), 0);
+}
+function extractContact(text?: string) {
+  const s = text || '';
+  const email = s.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi)?.[0] || '';
+  const website = s.match(/\bhttps?:\/\/[^\s]+|\bwww\.[^\s]+/gi)?.[0] || '';
+  const phone = s.match(/(\+?\d[\d\s\-().]{6,}\d)/g)?.[0] || '';
+  const company = s.match(/\b(company|co\.|s\.a\.|s\.l\.|ltd|llc|inc)\b/i) ? s : '';
+  return { email, website, whatsapp: phone, company: company ? s : '' };
+}
 
-// ---------- ROUTE ----------
+/* ---------------- route ---------------- */
 export async function POST(req: Request) {
   const { session_id, user_text = '', state = {}, hints = {}, language } = await req.json();
   const lang = language || guessLocaleFromText(user_text);
@@ -104,19 +121,41 @@ export async function POST(req: Request) {
   if (current === 'step1_intro' && hasStep1Minimum({ industry, role_level, geo_country })) {
     nextStep = 'step2_ai_fam';
   } else if (current === 'step2_ai_fam') {
-    // After asking familiarity, proceed to Step 3
     nextStep = 'step3_building_ground';
+  } else if (current === 'step3_building_ground') {
+    nextStep = 'step4_discovery';
+  } else if (current === 'step4_discovery') {
+    nextStep = 'step5_selection';
+  } else if (current === 'step5_selection') {
+    nextStep = 'step6_cta';
   }
 
-  // ---- prefetch scenarios when entering Step 2/3 ----
+  // ---- prefetch scenarios when entering Step 2/3/4/5 ----
   let preScenarios: KBScenario[] = state.preScenarios || [];
-  if ((nextStep === 'step2_ai_fam' || nextStep === 'step3_building_ground') && industry?.industry_id) {
+  if ((nextStep === 'step2_ai_fam' || nextStep === 'step3_building_ground' || nextStep === 'step4_discovery' || nextStep === 'step5_selection') && industry?.industry_id) {
     const q = deriveIntentKeywords(user_text) || 'intro,intake,automation';
     try {
-      const res = await kbSearchScenarios(industry.industry_id, q, 6);
+      const res = await kbSearchScenarios(industry.industry_id, q, 8);
       preScenarios = res.snippets || [];
     } catch {}
   }
+
+  // ---- discovery + selection helpers ----
+  const commonProblems = Array.from(new Set(preScenarios.map(s => trunc(s.problem, 120)).filter(Boolean))).slice(0, 3);
+  // for selection, pick best 2–3 agents
+  const selectedAgents = preScenarios.slice(0, 3);
+
+  // ---- CTA helpers ----
+  const buySignals = (state.buySignals || 0) + positiveSignalScore(user_text);
+  const contactIn  = extractContact(user_text);
+  const contact    = {
+    company: state.contact?.company || contactIn.company || '',
+    website: state.contact?.website || contactIn.website || '',
+    email:   state.contact?.email   || contactIn.email   || '',
+    whatsapp:state.contact?.whatsapp|| contactIn.whatsapp|| '',
+    prefer:  state.contact?.prefer  || (/\bwhats(app)?\b/i.test(user_text) ? 'whatsapp' : (/\bemail|mail\b/i.test(user_text) ? 'email' : ''))
+  };
+  const contactComplete = !!(contact.email || contact.whatsapp) && !!contact.website;
 
   // ---- build prompts per step ----
   let SYSTEM = '';
@@ -185,12 +224,82 @@ STATE: step3_building_ground
 AI experience: ${ai_exp}
 Industry: ${industry?.industry_name ?? 'unknown'}
 ROLE: ${role_level ?? 'unknown'}  GEO: ${geo_country ?? 'unknown'}${geo_state ? ', '+geo_state : ''}
-KB EXAMPLES (use if advanced; do not show raw text to user, paraphrase concisely):
+KB EXAMPLES (paraphrase concisely; don't dump raw text):
 ${top2 || 'N/A'}
 Rules:
 - Do NOT invent facts; only use KB content for specifics.
 - Keep two examples max; concise bullets allowed.
 - End by asking permission to tailor to their stack and volumes.`.trim();
+
+  } else if (nextStep === 'step4_discovery') {
+    SYSTEM = `
+You are “Alex”, AI Sales Consultant. STEP 4 ONLY (Discovery).
+- Ask them to walk through a typical day and pinpoint the single most impactful area to improve.
+- Use 2–3 industry-common problems from KB as mirrors (do not invent).
+- ≤7 sentences; one clear question at end.
+Language: ${lang}.`.trim();
+
+    DEV = `
+STATE: step4_discovery
+Industry: ${industry?.industry_name ?? 'unknown'}
+Common problems (from KB): ${commonProblems.join(' • ') || 'TBD'}
+Rules:
+- Ask 2–3 short second-level questions (manual vs automated; handoffs; approvals).
+- Mirror 1–2 plausible pains (from KB problems) and confirm.
+- End with: “Are some of these also happening for you?”.
+- Do NOT propose solutions yet; Step 5 will do agent selection.`.trim();
+
+  } else if (nextStep === 'step5_selection') {
+    // Prepare up to 3 agents to present
+    const top3 = selectedAgents.slice(0, 3).map((s, i) => (
+      `#${i+1} ${s.agent_name}\n` +
+      `Actual: ${trunc(s.actual_situation)}\n` +
+      `Problem: ${trunc(s.problem)}\n` +
+      `How: ${trunc(s.how_it_works)}\n` +
+      `After: ${trunc(s.narrative)}\n` +
+      (s.roi_hypothesis ? `ROI: ${trunc(s.roi_hypothesis, 100)}` : '')
+    )).join('\n---\n');
+
+    SYSTEM = `
+You are “Alex”, AI Sales Consultant. STEP 5 ONLY (Agent Selection).
+- Propose 2–3 agents that directly map to declared pains.
+- For each agent: Actual → Problem → Agent name → How it works → Life after.
+- If ROI available, add a soft line (“teams like yours typically save …”).
+- ≤7 sentences total; one check-in question at end.
+Language: ${lang}.`.trim();
+
+    DEV = `
+STATE: step5_selection
+Industry: ${industry?.industry_name ?? 'unknown'}
+Selected agents (paraphrase concisely; don't dump raw text):
+${top3 || 'N/A'}
+Rules:
+- Keep max 3 agents; each ≤ 5 bullets worth of content (concise).
+- End with: “Want one more example, or shall I show exactly how this would work in your business?”`.trim();
+
+  } else if (nextStep === 'step6_cta') {
+    // Decide CTA wording based on buySignals and contact status
+    const strongIntent = buySignals >= 3;
+    const needContact = !contactComplete;
+
+    SYSTEM = `
+You are “Alex”, AI Sales Consultant. STEP 6 ONLY (CTA).
+- Offer a personalized demo platform, low-pressure.
+- If contact details are missing, ask them to TYPE legal company name, website, and email or WhatsApp.
+- If they provided contact, confirm and ask delivery preference (email vs WhatsApp).
+- Only propose booking two time options if there are ≥3 positive buying signals.
+- ≤7 sentences; one question at end.
+Language: ${lang}.`.trim();
+
+    DEV = `
+STATE: step6_cta
+Buy signals score: ${buySignals}
+Contact so far: email=${contact.email||'-'} website=${contact.website||'-'} whatsapp=${contact.whatsapp||'-'} prefer=${contact.prefer||'-'}
+Rules:
+- If contact incomplete, ask them to TYPE company + website + email/WhatsApp.
+- If contact complete, confirm and ask delivery preference (email or WhatsApp).
+- If ≥3 buying signals, propose: “Wednesday 10:00” or “Thursday 15:00 (your time)?”
+- Keep it friendly, no pressure, and concise.`.trim();
   }
 
   const messages = [
@@ -216,8 +325,12 @@ Rules:
     persona: persona || null,
     geo: geo || null,
     lang,
-    preScenarios,                          // keep the slice for next turns
+    preScenarios,
     ai_experience: classifyAIExperience(user_text) || state.ai_experience || null,
+    commonProblems,
+    selectedAgents,
+    buySignals,
+    contact,
   };
 
   return new StreamingTextResponse(OpenAIStream(rsp), {
