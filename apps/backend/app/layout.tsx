@@ -1,4 +1,3 @@
-// apps/backend/app/layout.tsx
 export const metadata = {
   title: "AI Agent Backend",
   description: "KB API + minimal root layout for Next.js app router",
