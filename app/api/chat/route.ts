@@ -1,6 +1,7 @@
 // File: app/api/chat/route.ts
 // pnpm add openai ai  (ou npm/yarn)
 // ENV: OPENAI_API_KEY, KB_SHEETS_URL, KB_TOKEN, (opt) LANG_DEFAULT
+
 import { OpenAI } from 'openai';
 import { OpenAIStream, StreamingTextResponse } from 'ai';
 
@@ -72,6 +73,11 @@ function deriveIntentKeywords(text?: string) {
 function hasStep1Minimum(state:any) {
   return !!(state?.industry?.industry_id && state?.role_level && state?.geo_country);
 }
+function trunc(s: string, n=160) {
+  if (!s) return '';
+  const t = s.trim().replace(/\s+/g,' ');
+  return t.length > n ? t.slice(0, n-1) + '…' : t;
+}
 
 // ---------- ROUTE ----------
 export async function POST(req: Request) {
@@ -79,11 +85,9 @@ export async function POST(req: Request) {
   const lang = language || guessLocaleFromText(user_text);
   const current = state.current_step || 'step1_intro';
 
-  // ---- try enrich step1 slots if missing ----
+  // ---- enrich Step 1 slots if missing ----
   let industry: KBIndustry | null = state.industry || null;
-  if (!industry && user_text) {
-    try { industry = await kbIndustryMatch(user_text); } catch {}
-  }
+  if (!industry && user_text) { try { industry = await kbIndustryMatch(user_text); } catch {} }
   const role_level = state.role_level || normalizeRoleLevel(user_text) || hints.role_level || null;
   const geo_country = state.geo_country || hints.geo_country || null;
   const geo_state   = state.geo_state   || hints.geo_state   || null;
@@ -99,6 +103,19 @@ export async function POST(req: Request) {
   let nextStep = current;
   if (current === 'step1_intro' && hasStep1Minimum({ industry, role_level, geo_country })) {
     nextStep = 'step2_ai_fam';
+  } else if (current === 'step2_ai_fam') {
+    // After asking familiarity, proceed to Step 3
+    nextStep = 'step3_building_ground';
+  }
+
+  // ---- prefetch scenarios when entering Step 2/3 ----
+  let preScenarios: KBScenario[] = state.preScenarios || [];
+  if ((nextStep === 'step2_ai_fam' || nextStep === 'step3_building_ground') && industry?.industry_id) {
+    const q = deriveIntentKeywords(user_text) || 'intro,intake,automation';
+    try {
+      const res = await kbSearchScenarios(industry.industry_id, q, 6);
+      preScenarios = res.snippets || [];
+    } catch {}
   }
 
   // ---- build prompts per step ----
@@ -126,18 +143,7 @@ Rules:
 - End with one question to progress capture.`.trim();
 
   } else if (nextStep === 'step2_ai_fam') {
-    // classify and prefetch scenarios
-    const ai_exp = classifyAIExperience(user_text);
-    const q = deriveIntentKeywords(user_text) || 'intro,intake,automation';
-    let scenarios: KBScenario[] = [];
-    try {
-      if (industry?.industry_id) {
-        const res = await kbSearchScenarios(industry.industry_id, q, 6);
-        scenarios = res.snippets || [];
-      }
-    } catch {}
-    const scenarioHints = scenarios.slice(0,2).map((s,i)=> `${i+1}. ${s.agent_name}`).join(' • ');
-
+    const scenarioHints = preScenarios.slice(0,2).map((s,i)=> `${i+1}. ${s.agent_name}`).join(' • ');
     SYSTEM = `
 You are “Alex”, AI Sales Consultant. STEP 2 ONLY (AI familiarity).
 - Ask how familiar they are with AI (newcomer vs advanced).
@@ -150,12 +156,41 @@ STATE: step2_ai_fam
 Industry: ${industry?.industry_name ?? 'unknown'}
 Role level: ${role_level ?? 'unknown'}
 Geo: ${geo_country ?? 'unknown'}${geo_state ? ', '+geo_state : ''}
-Classify ai_experience from user's last message: newcomer|intermediate|advanced.
-Preload scenarios (max 6). Example agents (tease only): ${scenarioHints || 'TBD'}.
+Scenarios (tease only): ${scenarioHints || 'TBD'}
 Rules:
 - If newcomer, propose “two very simple examples”.
 - If advanced, propose “two industry-specific examples”.
 - End with one question that sets up Step 3 (examples preference).`.trim();
+
+  } else if (nextStep === 'step3_building_ground') {
+    const ai_exp = state.ai_experience || classifyAIExperience(user_text);
+    const top2 = preScenarios.slice(0, 2).map((s, i) => (
+      `#${i+1} ${s.agent_name}\n` +
+      `Actual: ${trunc(s.actual_situation)}\n` +
+      `Problem: ${trunc(s.problem)}\n` +
+      `How: ${trunc(s.how_it_works)}\n` +
+      `After: ${trunc(s.narrative)}`
+    )).join('\n---\n');
+
+    SYSTEM = `
+You are “Alex”, AI Sales Consultant. STEP 3 ONLY (Building Ground).
+- If newcomer: give two very simple general examples, then ask to move to industry-specific.
+- If advanced: present two industry-specific examples using KB snippets.
+- Use structure: Actual → Problem → Agent → How it works → Life after. 
+- ≤7 sentences total; one question at end.
+Language: ${lang}.`.trim();
+
+    DEV = `
+STATE: step3_building_ground
+AI experience: ${ai_exp}
+Industry: ${industry?.industry_name ?? 'unknown'}
+ROLE: ${role_level ?? 'unknown'}  GEO: ${geo_country ?? 'unknown'}${geo_state ? ', '+geo_state : ''}
+KB EXAMPLES (use if advanced; do not show raw text to user, paraphrase concisely):
+${top2 || 'N/A'}
+Rules:
+- Do NOT invent facts; only use KB content for specifics.
+- Keep two examples max; concise bullets allowed.
+- End by asking permission to tailor to their stack and volumes.`.trim();
   }
 
   const messages = [
@@ -181,8 +216,8 @@ Rules:
     persona: persona || null,
     geo: geo || null,
     lang,
-    // keep classification handy for Step 3
-    ai_experience: nextStep === 'step2_ai_fam' ? classifyAIExperience(user_text) : (state.ai_experience || null),
+    preScenarios,                          // keep the slice for next turns
+    ai_experience: classifyAIExperience(user_text) || state.ai_experience || null,
   };
 
   return new StreamingTextResponse(OpenAIStream(rsp), {
