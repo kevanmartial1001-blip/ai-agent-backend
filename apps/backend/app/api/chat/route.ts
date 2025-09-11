@@ -1,12 +1,11 @@
-/* app/api/chat/route.ts — COMPLETE DROP-IN
-   - Edge runtime + streaming
-   - Strict 6-step controller (anti-vagueness)
-   - KB helpers (Google Apps Script gateway)
-   - Lightweight slot extractor from user text
+/* app/api/chat/route.ts — VERSION SANS STREAMING (fix types)
+   - Edge runtime
+   - Step controller strict (6 étapes)
+   - Connexion KB (Apps Script)
+   - Réponse textuelle "plein bloc" (pas de OpenAIStream)
 */
 
 import OpenAI from 'openai';
-import { OpenAIStream, StreamingTextResponse } from 'ai';
 
 export const runtime = 'edge';
 
@@ -46,7 +45,7 @@ function injectGuardrails(base: string, state: AgentState): string {
   return base + guard;
 }
 
-// ==== Base Script (short form to save tokens; HeyGen has full one) ====
+// ==== Base Script (condensé) ====
 const BASE_PROMPT = `
 You are “Alex”, an AI sales consultant for AI Agents (“digital employees”).
 Follow EXACTLY 6 steps: 1 Intro → 2 AI familiarity → 3 Building Ground → 4 Discovery → 5 Agent Selection → 6 CTA Demo.
@@ -98,7 +97,7 @@ async function kbSearchScenarios(p: {industry_id:string, q?:string, limit?:numbe
   return kb('search_scenarios', p);
 }
 
-// ==== Slot Extractor (light heuristic from user text) ====
+// ==== Slot Extractor (simple) ====
 const COUNTRY_WORDS = ['usa','united states','uk','united kingdom','canada','australia','germany','france','spain','mexico','singapore','uae','switzerland','netherlands','sweden','denmark','norway','finland','iceland'];
 const ROLE_MAP: Record<string,string> = {
   'ceo':'CEO','cfo':'C_SUITE','coo':'C_SUITE','cto':'C_SUITE','cmo':'C_SUITE','vp':'C_SUITE','director':'MANAGEMENT','manager':'MANAGEMENT','lead':'MANAGEMENT','staff':'EMPLOYEES','employee':'EMPLOYEES'
@@ -108,12 +107,10 @@ const US_STATES = ['alabama','alaska','arizona','arkansas','california','colorad
 function extractFromUser(userText: string, slots: Record<string, any>) {
   const t = (userText || '').toLowerCase();
 
-  // role_level
   for (const k of Object.keys(ROLE_MAP)) {
     if (t.includes(k) && !slots.role_level) { slots.role_level = ROLE_MAP[k]; break; }
   }
 
-  // geo_country
   for (const c of COUNTRY_WORDS) {
     if (t.includes(c) && !slots.geo_country) {
       slots.geo_country = c.toUpperCase();
@@ -121,14 +118,12 @@ function extractFromUser(userText: string, slots: Record<string, any>) {
     }
   }
 
-  // geo_state (if USA)
   if ((slots.geo_country||'').startsWith('USA') || t.includes('usa') || t.includes('united states')) {
     for (const s of US_STATES) {
       if (t.includes(s) && !slots.geo_state) { slots.geo_state = s; break; }
     }
   }
 
-  // contact fields (Step 6)
   const emailMatch = userText.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/ig);
   const urlMatch = userText.match(/\bhttps?:\/\/[^\s]+/ig);
   const phoneMatch = userText.match(/(\+?\d[\d\s\-().]{7,})/g);
@@ -136,7 +131,6 @@ function extractFromUser(userText: string, slots: Record<string, any>) {
   if (phoneMatch && !slots.contact_channel) { slots.contact_channel = 'WhatsApp'; slots.contact_phone = phoneMatch[0]; }
   if (urlMatch && !slots.contact_website) { slots.contact_website = urlMatch[0]; }
 
-  // simple pain detection
   if (!slots.problems && /\b(pain|problem|issue|bottleneck|slow|delay|error|churn|stockout|late)\b/i.test(userText)) {
     slots.problems = [userText];
   }
@@ -144,7 +138,7 @@ function extractFromUser(userText: string, slots: Record<string, any>) {
   return slots;
 }
 
-// ==== Build KB Context (short snippets) ====
+// ==== KB context builder ====
 function buildKbContext(industry:any, persona:any, geo:any, scenarios:any[]): string {
   const parts: string[] = [];
   if (industry) {
@@ -172,32 +166,30 @@ function buildKbContext(industry:any, persona:any, geo:any, scenarios:any[]): st
 
 // ==== Route ====
 export async function POST(request: Request) {
-  const { user_text, state, session_id } = await request.json();
+  const { user_text, state } = await request.json();
 
-  // Initialize state
   const current: AgentState = state ?? { step: 1, slots: {} };
   current.slots = current.slots || {};
 
-  // 1) Heuristic extraction from user text
+  // 1) Heuristic extraction
   extractFromUser(user_text || '', current.slots);
 
-  // 2) KB lookups (best-effort, fast)
+  // 2) KB lookups
   let industry = null, persona = null, geo = null, scenarios: any[] = [];
   try {
     if (!current.slots.industry_id) {
       const ind = await kbGetIndustryMatch(user_text || '');
-      if (ind && ind.industry_id) {
-        current.slots.industry_id = ind.industry_id;
-        current.slots.industry_name = ind.industry_name || ind.industry_id;
-        current.slots.key_pain = (ind.key_pains || '').split(';')[0] || '';
-        industry = ind;
+      if (ind && (ind as any).industry_id) {
+        current.slots.industry_id = (ind as any).industry_id;
+        current.slots.industry_name = (ind as any).industry_name || (ind as any).industry_id;
+        current.slots.key_pain = ((ind as any).key_pains || '').split(';')[0] || '';
+        industry = ind as any;
       }
     }
     if (current.slots.industry_id && !industry) {
       industry = { industry_id: current.slots.industry_id, industry_name: current.slots.industry_name, key_pains: current.slots.key_pain };
     }
 
-    // persona + geo if we have minimal keys
     if (current.slots.industry_id && current.slots.role_level && !current.slots.persona_id) {
       persona = await kbGetPersona({ industry_id: current.slots.industry_id, role_level: current.slots.role_level, locale: current.slots.geo_country });
       if (persona && (persona as any).persona_id) current.slots.persona_id = (persona as any).persona_id;
@@ -207,34 +199,40 @@ export async function POST(request: Request) {
       geo = await kbGetGeo({ industry_id: current.slots.industry_id, country: current.slots.geo_country, state: current.slots.geo_state });
     }
 
-    // preload/top scenarios for the industry
     if (current.slots.industry_id) {
       const q = current.step <= 3 ? 'intro,intake,automation' : '';
       const sc = await kbSearchScenarios({ industry_id: current.slots.industry_id, q, limit: 6 });
-      if (Array.isArray(sc)) scenarios = sc;
+      if (Array.isArray(sc)) scenarios = sc as any[];
     }
   } catch {}
 
-  // 3) Build system prompt with guardrails + KB context
+  // 3) Build system prompt
   let systemPrompt = injectGuardrails(BASE_PROMPT, current);
   systemPrompt += buildKbContext(industry, persona, geo, scenarios);
 
-  // 4) Call OpenAI (stream)
-  const response = await openai.chat.completions.create({
+  // 4) Call OpenAI (NO streaming to avoid type mismatch)
+  const completion = await openai.chat.completions.create({
     model: 'gpt-4o-mini',
     temperature: 0.3,
-    stream: true,
+    stream: false,
     messages: [
       { role: 'system', content: systemPrompt },
       { role: 'user', content: user_text || '' }
     ]
   });
 
-  // 5) Compute next state (we don’t auto-advance if required slots are missing)
+  const answer = completion.choices?.[0]?.message?.content ?? '';
+
+  // 5) Next state
   const updated: AgentState = { step: nextStepIfComplete(current), slots: current.slots };
 
-  const stream = OpenAIStream(response);
-  return new StreamingTextResponse(stream, {
-    headers: { 'x-next-state': JSON.stringify(updated) }
+  return new Response(answer, {
+    status: 200,
+    headers: {
+      'Content-Type': 'text/plain; charset=utf-8',
+      'x-next-state': JSON.stringify(updated),
+      // optionnel CORS si tu en as besoin :
+      // 'Access-Control-Allow-Origin': '*'
+    }
   });
 }
