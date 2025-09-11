@@ -1,168 +1,95 @@
 "use client";
 
+/**
+ * Bare video page for the AI call.
+ * - Loads HeyGen SDK via your proxy /api/heygen-sdk
+ * - Starts avatar on postMessage { cmd: "start" }
+ * - Stops avatar on postMessage { cmd: "stop" }
+ * - Auto-Listen: mic + VAD -> /api/stt -> parent postMessage { type:"transcript", text }
+ * - Speak: listens to { cmd:"speak", text } to voice partial sentences in real-time
+ * - Posts { type:"ready" } when loaded and { type:"status", value } changes
+ */
+
 import { useEffect, useRef, useState } from "react";
 
-declare global {
-  interface Window {
-    __heygen?: any;
-  }
-}
-
-export default function Call() {
-  // Config
+export default function CallBare() {
   const AVATAR_ID = "5c3a094338ac46649c630d3929a78196";
-  const API_BASE  = ""; // même domaine
   const TOKEN_URL = "/api/heygen-token";
-  const CHAT_URL  = "/api/chat";
   const STT_URL   = "/api/stt";
   const SDK_URL   = "/api/heygen-sdk"; // proxy local
 
-  // State/UI
   const videoRef = useRef<HTMLVideoElement | null>(null);
-  const [status, setStatus] = useState("Offline • Alex");
-  const [log, setLog] = useState<string[]>([]);
-  const [input, setInput] = useState("");
-  const [sending, setSending] = useState(false);
-  const [listening, setListening] = useState(false);
-
-  // HeyGen SDK
   const avatarRef = useRef<any>(null);
-  const speakingRef = useRef(false);
-  const speakQueue = useRef<string[]>([]);
-  function pushLog(role: "bot" | "user", text: string) {
-    setLog((l) => [...l, (role === "user" ? "You: " : "Alex: ") + text]);
+  const TaskTypeRef = useRef<any>(null);
+
+  const [status, setStatus] = useState<"offline"|"live">("offline");
+  const listeningRef = useRef(false);
+
+  // --- utils
+  function post(msg: any) {
+    try { window.parent?.postMessage(msg, "*"); } catch {}
   }
 
   async function loadSDK() {
-    if ((window as any).__heygen) return (window as any).__heygen;
     const mod = await import(SDK_URL);
-    (window as any).__heygen = mod;
     return mod;
   }
 
   async function getToken() {
     const r = await fetch(TOKEN_URL, { method: "POST" });
+    if (!r.ok) throw new Error("token_failed");
     const j = await r.json();
     return j.token as string;
   }
 
-  async function start() {
+  async function startAvatar() {
     try {
       const { StreamingAvatar, StreamingEvents, AvatarQuality, TaskType } = await loadSDK();
       const token = await getToken();
-      const avatar = new StreamingAvatar({ token });
 
+      const avatar = new StreamingAvatar({ token });
       avatar.on(StreamingEvents.STREAM_READY, (ev: any) => {
         const stream = ev.detail;
         if (videoRef.current && stream) {
           videoRef.current.srcObject = stream;
           videoRef.current.muted = false;
-          videoRef.current.play().catch(() => {});
+          videoRef.current.play().catch(()=>{});
         }
-        setStatus("Live • Alex");
+        setStatus("live");
+        post({ type: "status", value: "live" });
       });
 
       await avatar.createStartAvatar({
-        quality: (AvatarQuality as any).High,
+        quality: AvatarQuality.High,
         avatarName: AVATAR_ID,
         language: "en",
         activityIdleTimeout: 600
       });
 
-      avatarRef.current = { avatar, TaskType };
+      avatarRef.current = avatar;
+      TaskTypeRef.current = TaskType;
 
-      const greet = "Hi! I’m Alex. I’m listening. Tell me your industry, role and where you’re based.";
-      pushLog("bot", greet);
-      await avatar.speak({ text: greet, task_type: (TaskType as any).REPEAT });
-
-      autoListen(); // micro + VAD
-    } catch (e: any) {
-      pushLog("bot", "Voice engine failed to load here. Please check browser permissions.");
+      // greet is handled by parent via "speak", we just start listening
+      autoListen();
+    } catch (e:any) {
+      post({ type: "error", value: e?.message || "engine_error" });
     }
   }
 
-  async function stop() {
-    try { await avatarRef.current?.avatar?.stopAvatar(); } catch {}
-    setStatus("Offline • Alex");
-    setListening(false);
+  async function stopAvatar() {
+    try { await avatarRef.current?.stopAvatar(); } catch {}
+    listeningRef.current = false;
+    setStatus("offline");
+    post({ type: "status", value: "offline" });
   }
 
-  async function sendToKBStream(userText: string) {
-    if (!userText || sending) return;
-    setSending(true);
-    pushLog("user", userText);
-
-    try {
-      const res = await fetch(CHAT_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ user_text: userText })
-      });
-
-      const nextHeader = res.headers.get("x-next-state"); // tu peux l’utiliser si besoin
-      // Streaming read
-      const reader = res.body?.getReader();
-      const dec = new TextDecoder();
-      let full = "";
-      let sentenceBuf = "";
-
-      async function enqueueSpeak(text: string) {
-        if (!text.trim()) return;
-        speakQueue.current.push(text.trim());
-        if (speakingRef.current) return;
-        speakingRef.current = true;
-        while (speakQueue.current.length) {
-          const t = speakQueue.current.shift()!;
-          await avatarRef.current?.avatar?.speak({ text: t, task_type: avatarRef.current?.TaskType?.REPEAT });
-        }
-        speakingRef.current = false;
-      }
-
-      while (reader) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const chunk = dec.decode(value, { stream: true });
-        full += chunk;
-        sentenceBuf += chunk;
-
-        // Affiche en direct
-        setLog((l) => {
-          const copy = [...l];
-          const last = copy[copy.length - 1];
-          if (last && last.startsWith("Alex: ")) {
-            copy[copy.length - 1] = "Alex: " + (full || "");
-          } else {
-            copy.push("Alex: " + (full || ""));
-          }
-          return copy;
-        });
-
-        // Déclenche parole par phrases
-        const boundary = sentenceBuf.search(/[\.!?]\s/);
-        if (boundary > 40) {
-          const sent = sentenceBuf.slice(0, boundary + 1);
-          sentenceBuf = sentenceBuf.slice(boundary + 1);
-          await enqueueSpeak(sent);
-        }
-      }
-
-      if (sentenceBuf.trim()) {
-        await enqueueSpeak(sentenceBuf.trim());
-      }
-    } catch {
-      pushLog("bot", "…network error, please try again.");
-    } finally {
-      setSending(false);
-    }
-  }
-
-  // ---- Auto listen (VAD simple) ----
+  // --- Auto Listen (VAD + Deepgram)
   async function autoListen() {
     try {
       const mic = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+        audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true }
       });
-      setListening(true);
+      listeningRef.current = true;
 
       const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
       const source = ctx.createMediaStreamSource(mic);
@@ -189,9 +116,9 @@ export default function Call() {
             const stt = await fetch(STT_URL, { method: "POST", headers: { "Content-Type": "audio/webm" }, body: blob });
             const j = await stt.json();
             const text = (j.text || "").trim();
-            if (text) await sendToKBStream(text);
+            if (text) post({ type: "transcript", text });
           } catch {
-            pushLog("bot", "(STT error)");
+            post({ type: "error", value: "stt_failed" });
           }
         };
         rec.start(300);
@@ -199,7 +126,7 @@ export default function Call() {
       function stopChunk() { if (rec && rec.state !== "inactive") rec.stop(); rec = null; }
 
       function loop() {
-        if (!listening) return;
+        if (!listeningRef.current) return;
         requestAnimationFrame(loop);
         analyser.getFloatTimeDomainData(data);
         const now = performance.now(), dt = now - lastTime; lastTime = now;
@@ -213,7 +140,6 @@ export default function Call() {
         }
 
         const THRESH = Math.max(0.01, baseline * 3);
-
         if (level > THRESH) {
           silenceMs = 0;
           if (!isSpeaking) { isSpeaking = true; startChunk(); }
@@ -226,45 +152,37 @@ export default function Call() {
       }
       loop();
     } catch {
-      pushLog("bot", "Microphone permission denied.");
+      post({ type: "error", value: "mic_denied" });
     }
   }
 
-  return (
-    <div style={{ background:"#0f1115", color:"#e8eaf0", minHeight:"100vh", display:"grid", gridTemplateColumns:"minmax(0,2fr) minmax(280px,1fr)", gap:14, padding:16 }}>
-      {/* Stage */}
-      <div style={{ position:"relative", background:"#161a22", border:"1px solid #23293a", borderRadius:16, overflow:"hidden", minHeight:"76vh" }}>
-        <video ref={videoRef} autoPlay playsInline style={{ width:"100%", height:"100%", objectFit:"cover", background:"#000" }} />
-        <div style={{ position:"absolute", left:12, top:12, display:"flex", gap:8 }}>
-          <span style={{ background:"#10213a", border:"1px solid #1a3a7a", color:"#cfe1ff", padding:"4px 10px", borderRadius:999, fontSize:12, fontWeight:700 }}>{status}</span>
-          {listening && <span style={{ display:"inline-flex", alignItems:"center", gap:8, background:"#0b1b10", border:"1px solid #123b22", color:"#b9f6ca", padding:"4px 10px", borderRadius:999, fontSize:12 }}><span style={{ width:9, height:9, borderRadius:"50%", background:"#22c55e", boxShadow:"0 0 0 6px rgba(34,197,94,.12)" }} />Listening…</span>}
-        </div>
-        <div style={{ position:"absolute", left:0, right:0, bottom:0, background:"linear-gradient(180deg,transparent,rgba(15,17,21,.88))", padding:"10px 12px" }}>
-          <div style={{ display:"flex", gap:8, justifyContent:"space-between", alignItems:"center" }}>
-            <div style={{ display:"flex", gap:8 }}>
-              <button onClick={start} style={{ padding:"10px 14px", borderRadius:10, border:"none", background:"#4f8cff", color:"#fff", fontWeight:700 }}>Start</button>
-              <button onClick={stop} style={{ padding:"10px 14px", borderRadius:10, border:"none", background:"#ef4444", color:"#fff", fontWeight:700 }}>End</button>
-            </div>
-            <div style={{ display:"flex", gap:8, flex:1 }}>
-              <input value={input} onChange={e=>setInput(e.target.value)} onKeyDown={e=>{ if(e.key==="Enter"){ const t=input.trim(); if(t){ setInput(""); pushLog("user", t); sendToKBStream(t);} } }} placeholder="Type a message…" style={{ flex:1, background:"#202534", border:"1px solid #23293a", borderRadius:10, color:"#e8eaf0", padding:"12px" }} />
-              <button disabled={sending} onClick={()=>{ const t=input.trim(); if(!t) return; setInput(""); pushLog("user", t); sendToKBStream(t); }} style={{ padding:"10px 14px", borderRadius:10, border:"none", background:"#4f8cff", color:"#fff", fontWeight:700 }}>{sending ? "Sending…" : "Send"}</button>
-            </div>
-          </div>
-        </div>
-      </div>
+  // --- Speak segments coming from parent (per-sentence for low latency)
+  async function speak(text: string) {
+    if (!text?.trim()) return;
+    try {
+      await avatarRef.current?.speak({ text, task_type: TaskTypeRef.current?.REPEAT });
+    } catch {}
+  }
 
-      {/* Chat */}
-      <div style={{ background:"#161a22", border:"1px solid #23293a", borderRadius:16, minHeight:"76vh", display:"flex", flexDirection:"column", overflow:"hidden" }}>
-        <div style={{ padding:"10px 12px", borderBottom:"1px solid #23293a", display:"flex", justifyContent:"space-between" }}>
-          <div style={{ fontWeight:700 }}>Chat</div>
-          <button onClick={()=>setLog([])} style={{ padding:"6px 10px", borderRadius:8, border:"1px solid #23293a", background:"transparent", color:"#e8eaf0" }}>Clear</button>
-        </div>
-        <div style={{ flex:1, overflow:"auto", padding:12, whiteSpace:"pre-wrap" }}>
-          {log.map((line, i)=>(
-            <div key={i} style={{ margin:"8px 6px" }}>{line}</div>
-          ))}
-        </div>
-      </div>
+  // --- PostMessage control plane
+  useEffect(() => {
+    post({ type: "ready" });
+    const onMsg = (ev: MessageEvent) => {
+      const d = ev.data || {};
+      if (!d || typeof d !== "object") return;
+      if (d.cmd === "start") startAvatar();
+      else if (d.cmd === "stop") stopAvatar();
+      else if (d.cmd === "speak") speak(String(d.text || ""));
+    };
+    window.addEventListener("message", onMsg);
+    return () => window.removeEventListener("message", onMsg);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  return (
+    <div style={{ background:"#000", width:"100%", height:"100vh" }}>
+      <video ref={videoRef} autoPlay playsInline style={{ width:"100%", height:"100%", objectFit:"cover", background:"#000" }} />
+      {/* No UI — controlled by parent via postMessage */}
     </div>
   );
 }
