@@ -22,16 +22,11 @@ export async function POST(req: Request) {
   try {
     const audio = await req.arrayBuffer();
     const url = "https://api.deepgram.com/v1/listen?model=nova-2-general&smart_format=true&punctuate=true&detect_language=true";
-
     const r = await fetch(url, {
       method: "POST",
-      headers: {
-        Authorization: `Token ${dgKey}`,
-        "Content-Type": "audio/webm"
-      },
+      headers: { Authorization: `Token ${dgKey}`, "Content-Type": "audio/webm" },
       body: audio
     });
-
     const j = await r.json();
     let text = "";
     try {
@@ -42,7 +37,6 @@ export async function POST(req: Request) {
       }
       if (!text && j.transcript) text = j.transcript;
     } catch {}
-
     return new Response(JSON.stringify({ text }), {
       status: 200,
       headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
