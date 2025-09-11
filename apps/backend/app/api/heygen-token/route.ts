@@ -19,7 +19,6 @@ export async function POST() {
       headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
     });
   }
-
   try {
     const r = await fetch("https://api.heygen.com/v1/streaming.create_token", {
       method: "POST",
