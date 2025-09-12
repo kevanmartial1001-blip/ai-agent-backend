@@ -1,6 +1,7 @@
 /* app/api/chat/route.ts
-   Conversational Flow Guard + KB-lite enrichment + streaming
-   Env: OPENAI_API_KEY, KB_BASE_URL (Apps Script/Web API)
+   Conversational Flow Guard + KB-light enrichment + streaming
+   Enforces: country first; ask state only if USA; NO DEMO until all steps done.
+   Env: OPENAI_API_KEY, KB_BASE_URL (Apps Script / Web API)
 */
 export const runtime = 'edge';
 
@@ -9,7 +10,7 @@ import OpenAI from 'openai';
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
 
 type Step =
-  | 'INTRO'              // Turn 1: name+what you do; Turn 2: ack + ask location
+  | 'INTRO'              // T1: name+what you do; T2: ack+country; (if USA, T3: state)
   | 'AI_PRIMER'
   | 'AGENTS_PRIMER'
   | 'INDUSTRY_PROBLEMS'
@@ -27,12 +28,12 @@ interface Slots {
   key_pain?: string;
   role_level?: RoleLevel | string;
   geo_country?: string;
-  geo_state?: string;
+  geo_state?: string;            // required ONLY if geo_country is USA/United States
   ai_experience?: 'newcomer'|'intermediate'|'advanced'|'unknown';
   problems?: string[];
   priorities?: string[];
   volumes?: string;
-  typical_day?: string;          // <— obligatoire pour sortir de DISCOVERY
+  typical_day?: string;          // <— mandatory to exit DISCOVERY
   persona_id?: string;
 }
 
@@ -46,7 +47,7 @@ interface AgentState {
   slots: Slots;
 }
 
-// -------- CONFIG --------
+// ---- CONFIG ----
 const MIN_TURNS_BEFORE_CTA = 10;     // ~10 tours → ~7 min live
 const MIN_SECONDS_BEFORE_CTA = 420;  // 7 minutes
 const MIN_SIGNALS = 3;
@@ -60,30 +61,24 @@ const MIN_TURNS_PER_STEP: Partial<Record<Step, number>> = {
   SELECTION: 2
 };
 
-// -------- KB helpers --------
+// ---- KB helpers ----
 const KB_BASE = process.env.KB_BASE_URL; // ex: https://script.google.com/macros/s/XXX/exec
 
 async function kbIndustryMatch(q: string) {
   if (!KB_BASE || !q) return null;
   const url = `${KB_BASE}?fn=industry_match&q=${encodeURIComponent(q)}`;
-  try {
-    const r = await fetch(url, { cache: 'no-store' });
-    if (!r.ok) return null;
-    return await r.json();
-  } catch { return null; }
+  try { const r = await fetch(url, { cache: 'no-store' }); if (!r.ok) return null; return await r.json(); }
+  catch { return null; }
 }
 
 async function kbSearchScenarios(industry_id?: string, q?: string) {
   if (!KB_BASE || !industry_id) return [];
   const url = `${KB_BASE}?fn=scenarios&industry_id=${encodeURIComponent(industry_id)}&q=${encodeURIComponent(q||'')}&limit=6`;
-  try {
-    const r = await fetch(url, { cache: 'no-store' });
-    if (!r.ok) return [];
-    return await r.json();
-  } catch { return []; }
+  try { const r = await fetch(url, { cache: 'no-store' }); if (!r.ok) return []; return await r.json(); }
+  catch { return []; }
 }
 
-// -------- State helpers --------
+// ---- State helpers ----
 const nowSec = () => Math.floor(Date.now() / 1000);
 
 function normalizeState(input: any): AgentState {
@@ -111,23 +106,29 @@ function detectSignals(text: string): number {
 }
 
 function updateSlotsFrom(text: string, slots: Slots, currentStep: Step): Slots {
-  // name (best-effort)
+  // Name (best-effort)
   if (!slots.user_name) {
     const m = text.match(/\b(?:I am|I'm|I’m|My name is|Je m'appelle|Je m’appelle)\s+([A-Z][\p{L}’'-]+(?:\s+[A-Z][\p{L}’'-]+)*)/iu);
     if (m) slots.user_name = m[1];
   }
 
-  // country
+  // Country (ask universally)
   if (!slots.geo_country) {
-    const m = text.match(/\b(USA|United States|Canada|United Kingdom|UK|France|Germany|Spain|Australia|Singapore|UAE)\b/i);
-    if (m) slots.geo_country = m[0].toUpperCase() === 'UK' ? 'United Kingdom' : m[0];
+    const m = text.match(/\b(USA|United States|Canada|United Kingdom|UK|France|Germany|Spain|Australia|Singapore|UAE|United Arab Emirates|Mexico|Italy|Netherlands)\b/i);
+    if (m) {
+      const v = m[0];
+      slots.geo_country = /UK/i.test(v) ? 'United Kingdom' : (/United Arab Emirates/i.test(v) ? 'UAE' : v);
+    }
   }
-  // US state
-  if (slots.geo_country && /USA|United States/i.test(slots.geo_country) && !slots.geo_state) {
+
+  // If USA → ask/parse state; otherwise, never require it
+  const isUSA = !!slots.geo_country && /USA|United States/i.test(slots.geo_country);
+  if (isUSA && !slots.geo_state) {
     const st = text.match(/\b(AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|IA|ID|IL|IN|KS|KY|LA|MA|MD|ME|MI|MN|MO|MS|MT|NC|ND|NE|NH|NJ|NM|NV|NY|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VA|VT|WA|WI|WV)\b/);
     if (st) slots.geo_state = st[0];
   }
-  // role
+
+  // Role (light heuristic)
   if (!slots.role_level) {
     if (/CEO|founder|owner/i.test(text)) slots.role_level = 'CEO';
     else if (/C[-\s]?suite|CFO|COO|CTO|CMO/i.test(text)) slots.role_level = 'C_SUITE';
@@ -135,13 +136,15 @@ function updateSlotsFrom(text: string, slots: Slots, currentStep: Step): Slots {
     else if (/agent|rep|staff|employee/i.test(text)) slots.role_level = 'EMPLOYEES';
     else slots.role_level = 'UNKNOWN';
   }
-  // quick pain capture
+
+  // Pain capture
   if (/pain|problem|issue|bottleneck|slow|manual|error|churn|stockout|delay|retard|erreur/i.test(text)) {
     const p = (slots.problems || []);
     if (p.length < 6) p.push(text.slice(0, 180));
     slots.problems = p;
   }
-  // typical day (when in DISCOVERY we treat the user message as the day description if long enough)
+
+  // Typical day capture (during DISCOVERY)
   if (currentStep === 'DISCOVERY' && !slots.typical_day) {
     const wordCount = (text.trim().match(/\S+/g) || []).length;
     if (wordCount >= 15) slots.typical_day = text.slice(0, 1200);
@@ -156,10 +159,17 @@ function stepMinTurns(step: Step): number {
 function stepComplete(state: AgentState): boolean {
   const s = state.slots;
   const t = state.step_turns ?? 0;
+
   switch (state.step) {
-    case 'INTRO':
-      // enforce 2 turns in INTRO: (1) name+what you do, (2) ack + ask location
-      return t >= 2 && !!(s.industry_id || s.industry_text) && !!s.role_level && !!s.geo_country;
+    case 'INTRO': {
+      // 2 tours minimum:
+      // - T1: présentation (nom + ce qu’il fait)
+      // - T2: ack + pays (si USA → un tour suivant pour l’État)
+      const haveBasics = !!(s.industry_id || s.industry_text) && !!s.role_level && !!s.geo_country;
+      const needsState = !!s.geo_country && /USA|United States/i.test(s.geo_country) && !s.geo_state;
+      const minTurns = needsState ? 3 : 2;
+      return t >= minTurns && haveBasics && (!needsState);
+    }
     case 'AI_PRIMER':
     case 'AGENTS_PRIMER':
     case 'INDUSTRY_PROBLEMS':
@@ -190,41 +200,38 @@ function eligibleForCTA(state: AgentState): boolean {
     !!(s.industry_id || s.industry_text) &&
     !!s.role_level &&
     !!s.geo_country &&
+    (!!s.geo_state || !/USA|United States/i.test(s.geo_country || '')) &&
     !!s.typical_day &&
     (s.problems?.length || 0) >= 1;
   return okTurns && okTime && okSig && haveBasics;
 }
 
-// -------- System prompt --------
+// ---- System prompt ----
 function buildSystemPrompt(state: AgentState, kb: {industry?: any, scenarios?: any[]}) {
-  const pacing = `
-PACING & QUESTIONS:
-- One question per turn, always at the end.
-- Avoid interrogation. In AI_PRIMER / AGENTS_PRIMER / INDUSTRY_PROBLEMS, prioritize informative guidance (2–4 sentences), then one short question.
-- Keep 3–6 sentences per turn. Visual, concrete, human.
+  const guard = `
+HARD DEMO GUARD:
+- Do NOT mention or hint at a demo, trial, link, or booking until CURRENT STEP is CTA AND ELIGIBLE_FOR_CTA: YES.
+- If the user asks for a demo early: acknowledge positively and say you’ll set it up right after tailoring to their context, then continue the current step.
 
-STRICT MICRO-FLOW FOR INTRO:
+INTRO MICRO-FLOW:
 - Turn 1: Ask ONLY “Could you introduce yourself—your name and what you do?”
-- Turn 2: Acknowledge their industry with ONE relatable pain and a friendly common-ground line. Then ask ONLY “Where are you based? (Country; if USA, which state?)”.
+- Turn 2: Acknowledge their industry with ONE relatable pain and a friendly common-ground line. Then ask ONLY “Which country are you based in?”
+- If they answer USA/United States, ask the state on the next turn; otherwise move on.
 
 FLOW (strict):
-1) INTRO → micro-flow above (2 turns min) and capture industry + role + location.
+1) INTRO → capture industry + role + country (state only if USA).
 2) AI_PRIMER → ask familiarity; explain what AI is changing now and why.
 3) AGENTS_PRIMER → ask if they know AI Agents / digital employees; explain with 1–2 general examples.
-4) INDUSTRY_PROBLEMS → state common pains & consequences for their industry; ask permission to show tailored examples.
-5) DISCOVERY → MANDATORY “typical day” question; then ask about handoffs, repetitive tasks, manual vs automated (one per turn).
-6) SELECTION → suggest 2–3 agents (each: actual → problem → how it works → life-after).
-7) CTA → ONLY when the server says eligible. If asked early: acknowledge and continue until eligible.
-
-GUARDRAILS:
-- NEVER offer a demo before STEP 7 and server eligibility.
-- Use “typically”, “likely”, “teams like yours see…”. No hard promises.
-- For detailed/regulated info: brief answer + say you’ll also share details in the chat panel.
+4) INDUSTRY_PROBLEMS → state common pains & consequences; ask permission to show tailored examples.
+5) DISCOVERY → MANDATORY “typical day” first; then handoffs, repetitive tasks, manual vs automated (one per turn).
+6) SELECTION → suggest 2–3 agents (each: actual → problem → how it works → life-after picture).
+7) CTA → ONLY when server eligibility is YES.
+ALWAYS: one question at the end; 3–6 sentences per turn; informative tone, not interrogative.
 `;
 
   const stepHint = `CURRENT STEP: ${state.step}. ELIGIBLE_FOR_CTA: ${eligibleForCTA(state) ? 'YES' : 'NO'}.`;
-  const kbBits: string[] = [];
 
+  const kbBits: string[] = [];
   if (kb.industry) {
     const name = kb.industry.industry_name || kb.industry.industry_id || 'this industry';
     kbBits.push(`INDUSTRY: ${name}`);
@@ -237,13 +244,13 @@ GUARDRAILS:
 
   return [
     `You are “Alex”, a friendly AI consultant for AI Agents. Mirror the user’s language. Keep it concrete and visual.`,
-    pacing.trim(),
+    guard.trim(),
     kbBits.length ? `KB NOTES:\n${kbBits.join('\n')}` : '',
     stepHint
   ].filter(Boolean).join('\n\n');
 }
 
-// -------- Handler --------
+// ---- Handler ----
 export async function POST(req: Request) {
   const { user_text, state: raw } = await req.json();
 
@@ -254,7 +261,7 @@ export async function POST(req: Request) {
   state.signals = (state.signals || 0) + detectSignals(user_text);
   state.slots = updateSlotsFrom(user_text, state.slots, state.step);
 
-  // INTRO: industry mapping when industry_text present
+  // Map industry when we have free text (INTRO)
   if (state.step === 'INTRO' && state.slots.industry_text && !state.slots.industry_id) {
     const match = await kbIndustryMatch(state.slots.industry_text);
     if (match) {
@@ -299,6 +306,7 @@ export async function POST(req: Request) {
     messages
   });
 
+  // Simple streaming passthrough (on fait confiance au guard prompt).
   const rs = new ReadableStream({
     async start(controller) {
       const enc = new TextEncoder();
@@ -315,9 +323,9 @@ export async function POST(req: Request) {
     }
   });
 
-  // CTA hard lock – le modèle ne peut pas forcer le CTA avant l’éligibilité
+  // Server-side CTA hard lock (au cas où le modèle "parle" de démo trop tôt, l'état ne bouge pas)
   if (state.step === 'CTA' && !eligibleForCTA(state)) {
-    // on ne recule pas l'étape, mais le system prompt garde ELIGIBLE_FOR_CTA: NO
+    // On ne recule pas, mais le system prompt suivant indiquera encore ELIGIBLE_FOR_CTA: NO
   }
 
   return new Response(rs, {
