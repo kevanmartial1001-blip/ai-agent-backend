@@ -1,6 +1,6 @@
 /* app/api/chat/route.ts
-   Flow guard + KB-light enrichment + streaming
-   Requirements: NEXT_RUNTIME=edge, OPENAI_API_KEY, KB_BASE_URL (Apps Script/Web API)
+   Conversational Flow Guard + KB-lite enrichment + streaming
+   Env: OPENAI_API_KEY, KB_BASE_URL (Apps Script/Web API)
 */
 export const runtime = 'edge';
 
@@ -8,8 +8,15 @@ import OpenAI from 'openai';
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
 
-// ---- Types ----
-type Step = 'INTRO'|'FAMILIARITY'|'BUILDING'|'DISCOVERY'|'SELECTION'|'CTA';
+type Step =
+  | 'INTRO'
+  | 'AI_PRIMER'
+  | 'AGENTS_PRIMER'
+  | 'INDUSTRY_PROBLEMS'
+  | 'DISCOVERY'
+  | 'SELECTION'
+  | 'CTA';
+
 type RoleLevel = 'CEO'|'C_SUITE'|'MANAGEMENT'|'EMPLOYEES'|'UNKNOWN';
 
 interface Slots {
@@ -29,21 +36,31 @@ interface Slots {
 
 interface AgentState {
   step: Step;
-  started_at?: number;   // epoch seconds
-  turn?: number;         // # of exchanges
-  signals?: number;      // buying signals
+  started_at?: number;       // epoch seconds (session)
+  step_started_at?: number;  // epoch seconds (current step)
+  turn?: number;             // total exchanges
+  step_turns?: number;       // exchanges within the current step
+  signals?: number;          // buying signals
   slots: Slots;
 }
 
-// ---- Config (tunable) ----
-const MIN_TURNS_BEFORE_CTA = 10;     // ~10 messages → ~7 minutes en live
+// -------- CONFIG (tunable) --------
+const MIN_TURNS_BEFORE_CTA = 10;     // ~10 tours
 const MIN_SECONDS_BEFORE_CTA = 420;  // 7 minutes
 const MIN_SIGNALS = 3;
 
-// ---- KB helpers (Apps Script / custom API) ----
-// Attends un backend Google Apps Script avec endpoints simples.
-// Adapte les routes si besoin (GET pour simplicité / edge).
-const KB_BASE = process.env.KB_BASE_URL; // ex: "https://script.google.com/macros/s/XXX/exec"
+// **Pacing:** limiter l’aspect interrogatoire
+// - Dans les phases PRIMER/INDUSTRY, on privilégie l’info : 1 question max par tour (toujours), et 2 tours minimum par phase
+const MIN_TURNS_PER_STEP: Partial<Record<Step, number>> = {
+  AI_PRIMER: 2,
+  AGENTS_PRIMER: 2,
+  INDUSTRY_PROBLEMS: 2,
+  DISCOVERY: 2,
+  SELECTION: 2
+};
+
+// -------- KB helpers (Apps Script or any web API) --------
+const KB_BASE = process.env.KB_BASE_URL; // ex: https://script.google.com/macros/s/XXX/exec
 
 async function kbIndustryMatch(q: string) {
   if (!KB_BASE || !q) return null;
@@ -72,14 +89,17 @@ async function kbSearchScenarios(industry_id?: string, q?: string) {
   catch { return []; }
 }
 
-// ---- State helpers ----
-function nowSec() { return Math.floor(Date.now()/1000); }
+// -------- State helpers --------
+const nowSec = () => Math.floor(Date.now() / 1000);
 
 function normalizeState(input: any): AgentState {
+  const now = nowSec();
   const s: AgentState = {
     step: (input?.step as Step) || 'INTRO',
-    started_at: typeof input?.started_at === 'number' ? input.started_at : nowSec(),
+    started_at: typeof input?.started_at === 'number' ? input.started_at : now,
+    step_started_at: typeof input?.step_started_at === 'number' ? input.step_started_at : now,
     turn: typeof input?.turn === 'number' ? input.turn : 0,
+    step_turns: typeof input?.step_turns === 'number' ? input.step_turns : 0,
     signals: typeof input?.signals === 'number' ? input.signals : 0,
     slots: input?.slots || {}
   };
@@ -87,7 +107,6 @@ function normalizeState(input: any): AgentState {
 }
 
 function detectSignals(text: string): number {
-  // simple heuristics → monte à MIN_SIGNALS après 2–3 confirmations
   const sigs = [
     /this is great|love this|awesome|perfect|we need this|let's do it|sounds good/i,
     /send (me )?a demo|free trial|try it/i,
@@ -98,7 +117,6 @@ function detectSignals(text: string): number {
 }
 
 function updateSlotsFrom(text: string, slots: Slots): Slots {
-  // ultra-light extraction (tu peux brancher un NER plus tard)
   if (!slots.geo_country) {
     const m = text.match(/\b(USA|United States|Canada|United Kingdom|UK|France|Germany|Spain|Australia|Singapore|UAE)\b/i);
     if (m) slots.geo_country = m[0].toUpperCase() === 'UK' ? 'United Kingdom' : m[0];
@@ -114,32 +132,42 @@ function updateSlotsFrom(text: string, slots: Slots): Slots {
     else if (/agent|rep|staff|employee/i.test(text)) slots.role_level = 'EMPLOYEES';
     else slots.role_level = 'UNKNOWN';
   }
+  // quick pain capture
+  if (/pain|problem|issue|bottleneck|slow|manual|error|churn|stockout|delay/i.test(text)) {
+    const p = (slots.problems || []);
+    if (p.length < 6) p.push(text.slice(0, 160));
+    slots.problems = p;
+  }
   return slots;
+}
+
+function stepMinTurns(step: Step): number {
+  return MIN_TURNS_PER_STEP[step] ?? 1;
 }
 
 function stepComplete(state: AgentState): boolean {
   const s = state.slots;
+  const t = state.step_turns ?? 0;
   switch (state.step) {
     case 'INTRO':
       return !!(s.industry_id || s.industry_text) && !!s.role_level && !!s.geo_country;
-    case 'FAMILIARITY':
-      return !!s.ai_experience && s.ai_experience !== 'unknown';
-    case 'BUILDING':
-      return true; // après au moins un exemple
+    case 'AI_PRIMER':
+    case 'AGENTS_PRIMER':
+    case 'INDUSTRY_PROBLEMS':
+      return t >= stepMinTurns(state.step);
     case 'DISCOVERY':
-      return (s.problems && s.problems.length >= 1);
+      return (s.problems && s.problems.length >= 1) && t >= stepMinTurns(state.step);
     case 'SELECTION':
-      return true; // après avoir proposé 2–3 agents
+      return t >= stepMinTurns(state.step);
     case 'CTA':
       return true;
   }
 }
 
 function nextStep(state: AgentState): Step {
-  if (!stepComplete(state)) return state.step;
-  const order: Step[] = ['INTRO','FAMILIARITY','BUILDING','DISCOVERY','SELECTION','CTA'];
+  const order: Step[] = ['INTRO','AI_PRIMER','AGENTS_PRIMER','INDUSTRY_PROBLEMS','DISCOVERY','SELECTION','CTA'];
   const idx = order.indexOf(state.step);
-  return order[Math.min(idx+1, order.length-1)];
+  return order[Math.min(idx + 1, order.length - 1)];
 }
 
 function eligibleForCTA(state: AgentState): boolean {
@@ -152,59 +180,62 @@ function eligibleForCTA(state: AgentState): boolean {
   return okTurns && okTime && okSig && haveBasics;
 }
 
-// ---- System prompt builder ----
-function buildSystemPrompt(state: AgentState, kb: {industry?: any, persona?: any, geo?: any, scenarios?: any[]}){
-  const gateMsg = `
-FLOW (strict, do not skip or reorder):
-1) Intro → confirm AV, capture industry + role + country (state if USA). Acknowledge ONE pain.
-2) AI familiarity (newcomer vs experienced).
-3) Building → give 1–2 examples (general if unsure, else industry-specific).
-4) Discovery → typical day, manual vs automated, where handoffs slow, confirm main challenge.
-5) Selection → propose 2–3 agents (each: actual → problem → how it works → life-after).
-6) CTA (personalized demo) → ONLY when the server says eligible. If asked early, acknowledge and continue the flow.
+// -------- System prompt builder --------
+function buildSystemPrompt(state: AgentState, kb: {industry?: any, scenarios?: any[]}) {
+  const pacing = `
+PACING & QUESTIONS:
+- One question per turn, always at the end.
+- Avoid interrogation: during AI_PRIMER, AGENTS_PRIMER, and INDUSTRY_PROBLEMS, prioritize informative guidance. Use 2–4 sentences then a single short question.
+- Keep 3–6 sentences per turn. Visual, concrete, human.
+
+FLOW (strict):
+1) INTRO → confirm AV, capture industry + role + country (state if USA). Acknowledge ONE relevant pain.
+2) AI_PRIMER (≈ first 1–2 min) → ask familiarity; explain what AI is changing now and why.
+3) AGENTS_PRIMER (same window) → ask if they know “AI Agents / digital employees”; explain what they could do and how life changes (1–2 general examples).
+4) INDUSTRY_PROBLEMS (≈ next 2–3 min) → state common pains for their industry and typical consequences; ask permission to show examples tailored to them.
+5) DISCOVERY (≈ next 2–3 min) → ask for a typical day, repetitive tasks, handoffs, manual vs automated; confirm the main challenge.
+6) SELECTION → suggest 2–3 agents (each: actual situation → problem → how it works → life-after picture).
+7) CTA → ONLY when the server says eligible. If asked early: acknowledge and keep the flow until eligible.
 
 GUARDRAILS:
-- NEVER offer a demo before STEP 6 and server eligibility.
-- If the user insists early, say: “Great—we’ll set it up right after I tailor this to your context,” then continue.
-- Use “typically”, “likely”, “teams like yours see…”. Avoid hard promises.
-
-ALWAYS: 1 question at the end. 3–6 sentences per message. Mirror the user language.
+- NEVER offer a demo before STEP 7 and server eligibility.
+- Use “typically”, “likely”, “teams like yours see…”. No hard promises.
+- If they ask for detailed/regulated info, give a brief answer and say you’ll also share details in the chat panel.
 `;
 
+  const stepHint = `CURRENT STEP: ${state.step}. ELIGIBLE_FOR_CTA: ${eligibleForCTA(state) ? 'YES' : 'NO'}.`;
   const kbBits: string[] = [];
+
   if (kb.industry) {
-    kbBits.push(`INDUSTRY: ${kb.industry.industry_name || kb.industry.industry_id}`);
+    const name = kb.industry.industry_name || kb.industry.industry_id || 'this industry';
+    kbBits.push(`INDUSTRY: ${name}`);
     if (kb.industry.key_pains) kbBits.push(`Common pains: ${kb.industry.key_pains}`);
-    if (kb.industry.jargon)    kbBits.push(`Jargon: ${kb.industry.jargon}`);
-  }
-  if (kb.geo) {
-    if (kb.geo.governing_law) kbBits.push(`Geo rules hint: ${kb.geo.governing_law} / ${kb.geo.data_privacy_frameworks || ''}`.trim());
   }
   if (kb.scenarios?.length) {
-    const top = kb.scenarios.slice(0,3).map((s:any) => `• ${s.agent_name}: ${s.actual_situation} → ${s.problem} → how: ${s.how_it_works} → life-after: ${s.narrative}`).join('\n');
+    const top = kb.scenarios.slice(0,3).map((s:any)=>`• ${s.agent_name}: ${s.actual_situation} → ${s.problem} → how: ${s.how_it_works} → life-after: ${s.narrative}`).join('\n');
     kbBits.push(`Candidate scenarios:\n${top}`);
   }
 
-  const stepHint = `CURRENT STEP: ${state.step}. ELIGIBLE_FOR_CTA: ${eligibleForCTA(state) ? 'YES' : 'NO'}.`;
-
   return [
-    `You are “Alex”, a friendly AI consultant for AI Agents. Keep replies concrete, visual, human.`,
-    gateMsg.trim(),
+    `You are “Alex”, a friendly AI consultant for AI Agents. Mirror the user’s language. Keep it concrete and visual.`,
+    pacing.trim(),
     kbBits.length ? `KB NOTES:\n${kbBits.join('\n')}` : '',
     stepHint
   ].filter(Boolean).join('\n\n');
 }
 
-// ---- Handler ----
+// -------- Handler --------
 export async function POST(req: Request) {
   const { session_id, user_text, state: raw } = await req.json();
 
   let state = normalizeState(raw);
+  const prevStep = state.step;
   state.turn = (state.turn || 0) + 1;
+  state.step_turns = (state.step_turns || 0) + 1;
   state.signals = (state.signals || 0) + detectSignals(user_text);
   state.slots = updateSlotsFrom(user_text, state.slots);
 
-  // Intro: industry match (1er passage où industry_text non mappé)
+  // Map industry (first time we have free text)
   if (state.step === 'INTRO' && state.slots.industry_text && !state.slots.industry_id) {
     const match = await kbIndustryMatch(state.slots.industry_text);
     if (match) {
@@ -214,43 +245,41 @@ export async function POST(req: Request) {
     }
   }
 
-  // Persona & Geo (après role + geo)
-  if (state.step !== 'INTRO' && state.slots.industry_id && !state.slots.persona_id) {
-    const pg = await kbPersonaGeo(state.slots.industry_id, state.slots.role_level, state.slots.geo_country, state.slots.geo_state);
-    if (pg?.persona?.persona_id) state.slots.persona_id = pg.persona.persona_id;
+  // Persona/Geo (optional, if you expose endpoints)
+  if (state.slots.industry_id && prevStep !== 'INTRO' && !state.slots.persona_id) {
+    // const pg = await kbPersonaGeo(state.slots.industry_id, state.slots.role_level, state.slots.geo_country, state.slots.geo_state);
+    // if (pg?.persona?.persona_id) state.slots.persona_id = pg.persona.persona_id;
   }
 
-  // Scenarios (juste avant BUILDING/SELECTION)
+  // Scenarios lookup when needed
   let scenarios: any[] = [];
-  if ((state.step === 'BUILDING' || state.step === 'SELECTION') && state.slots.industry_id) {
-    scenarios = await kbSearchScenarios(
-      state.slots.industry_id,
-      (state.slots.problems||[]).slice(0,2).join(', ') || 'intro,intake,automation'
-    );
+  if ((state.step === 'INDUSTRY_PROBLEMS' || state.step === 'SELECTION') && state.slots.industry_id) {
+    const q = (state.slots.problems||[]).slice(0,2).join(', ') || 'intro,intake,automation';
+    scenarios = await kbSearchScenarios(state.slots.industry_id, q);
   }
 
-  // Step progression (sans sauter)
-  if (stepComplete(state)) state.step = nextStep(state);
+  // Progression (sans sauter)
+  if (stepComplete(state)) {
+    state.step = nextStep(state);
+    state.step_turns = 0;
+    state.step_started_at = nowSec();
+  }
 
-  // CTA lock: même si le modèle tente, on lui redira “NO” via system prompt tant que pas éligible
+  // System prompt
   const sys = buildSystemPrompt(state, {
     industry: (state.slots.industry_id || state.slots.industry_text) ? {
       industry_id: state.slots.industry_id,
       industry_name: state.slots.industry_name,
       key_pains: state.slots.key_pain
     } : null,
-    persona: state.slots.persona_id ? { persona_id: state.slots.persona_id } : null,
-    geo: null,
     scenarios
   });
 
-  // Compose chat messages (tu peux ajouter l'historique côté client si besoin)
   const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
     { role: 'system', content: sys },
     { role: 'user', content: user_text }
   ];
 
-  // Modèle compact pour vitesse; tu peux passer à gpt-4o si nécessaire
   const stream = await openai.chat.completions.create({
     model: 'gpt-4o-mini',
     stream: true,
@@ -258,7 +287,6 @@ export async function POST(req: Request) {
     messages
   });
 
-  // Edge streaming → Response
   const rs = new ReadableStream({
     async start(controller) {
       const enc = new TextEncoder();
@@ -267,21 +295,20 @@ export async function POST(req: Request) {
           const delta = (part.choices?.[0]?.delta?.content || '');
           if (delta) controller.enqueue(enc.encode(delta));
         }
-      } catch (e) {
-        controller.enqueue(new TextEncoder().encode('…network error')); // soft
+      } catch {
+        controller.enqueue(new TextEncoder().encode('…network error'));
       } finally {
         controller.close();
       }
     }
   });
 
-  // ATTENTION au CTA: si une réponse côté modèle force un CTA prématuré, on ne change PAS state.step.
-  // On autorisera CTA seulement quand eligibleForCTA(state) sera vrai.
+  // CTA lock: même si le modèle “veut”, on garde le verrou côté serveur
   if (state.step === 'CTA' && !eligibleForCTA(state)) {
-    // rétrograde virtuellement côté prompt (mais on garde step=CTA pour ne pas reculer l'état utilisateur)
-    // le system prompt déjà envoyé bloque le CTA → le modèle proposera de continuer discovery/selection.
+    // Le system prompt courant signale ELIGIBLE_FOR_CTA: NO → le modèle propose de poursuivre la découverte/selection
   }
 
-  const next = JSON.stringify(state);
-  return new Response(rs, { headers: { 'x-next-state': next } });
+  return new Response(rs, {
+    headers: { 'x-next-state': JSON.stringify(state) }
+  });
 }
