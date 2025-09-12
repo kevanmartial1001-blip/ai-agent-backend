@@ -1,6 +1,6 @@
 /* app/api/chat/route.ts
    Conversational Flow Guard + KB-light enrichment + streaming
-   Enforces: country first; ask state only if USA; NO DEMO until all steps done.
+   Enforces: country first; state only if USA; backchannel guidance; NO DEMO until all steps done.
    Env: OPENAI_API_KEY, KB_BASE_URL (Apps Script / Web API)
 */
 export const runtime = 'edge';
@@ -162,9 +162,7 @@ function stepComplete(state: AgentState): boolean {
 
   switch (state.step) {
     case 'INTRO': {
-      // 2 tours minimum:
-      // - T1: présentation (nom + ce qu’il fait)
-      // - T2: ack + pays (si USA → un tour suivant pour l’État)
+      // 2 tours minimum (3 si USA sans état)
       const haveBasics = !!(s.industry_id || s.industry_text) && !!s.role_level && !!s.geo_country;
       const needsState = !!s.geo_country && /USA|United States/i.test(s.geo_country) && !s.geo_state;
       const minTurns = needsState ? 3 : 2;
@@ -213,6 +211,10 @@ HARD DEMO GUARD:
 - Do NOT mention or hint at a demo, trial, link, or booking until CURRENT STEP is CTA AND ELIGIBLE_FOR_CTA: YES.
 - If the user asks for a demo early: acknowledge positively and say you’ll set it up right after tailoring to their context, then continue the current step.
 
+BACKCHANNEL:
+- You may start ~30–60% of your turns with a short, varied acknowledgment (≤2 words), adapted to the user’s language.
+- Never repeat the same backchannel twice in a row. Skip it when a direct answer is better.
+
 INTRO MICRO-FLOW:
 - Turn 1: Ask ONLY “Could you introduce yourself—your name and what you do?”
 - Turn 2: Acknowledge their industry with ONE relatable pain and a friendly common-ground line. Then ask ONLY “Which country are you based in?”
@@ -220,11 +222,11 @@ INTRO MICRO-FLOW:
 
 FLOW (strict):
 1) INTRO → capture industry + role + country (state only if USA).
-2) AI_PRIMER → ask familiarity; explain what AI is changing now and why.
-3) AGENTS_PRIMER → ask if they know AI Agents / digital employees; explain with 1–2 general examples.
+2) AI_PRIMER → ask familiarity; explain what AI is changing now and why. THEN add a crisp, ≤2-sentence definition of what an AI Agent is (“digital employee”).
+3) AGENTS_PRIMER → ask if they know AI Agents; explain with 1–2 general examples.
 4) INDUSTRY_PROBLEMS → state common pains & consequences; ask permission to show tailored examples.
 5) DISCOVERY → MANDATORY “typical day” first; then handoffs, repetitive tasks, manual vs automated (one per turn).
-6) SELECTION → suggest 2–3 agents (each: actual → problem → how it works → life-after picture).
+6) SELECTION → suggest 2–3 agents (each: actual → problem → how it works → life-after).
 7) CTA → ONLY when server eligibility is YES.
 ALWAYS: one question at the end; 3–6 sentences per turn; informative tone, not interrogative.
 `;
@@ -255,7 +257,6 @@ export async function POST(req: Request) {
   const { user_text, state: raw } = await req.json();
 
   let state = normalizeState(raw);
-  const prevStep = state.step;
   state.turn = (state.turn || 0) + 1;
   state.step_turns = (state.step_turns || 0) + 1;
   state.signals = (state.signals || 0) + detectSignals(user_text);
@@ -306,7 +307,6 @@ export async function POST(req: Request) {
     messages
   });
 
-  // Simple streaming passthrough (on fait confiance au guard prompt).
   const rs = new ReadableStream({
     async start(controller) {
       const enc = new TextEncoder();
@@ -323,10 +323,8 @@ export async function POST(req: Request) {
     }
   });
 
-  // Server-side CTA hard lock (au cas où le modèle "parle" de démo trop tôt, l'état ne bouge pas)
-  if (state.step === 'CTA' && !eligibleForCTA(state)) {
-    // On ne recule pas, mais le system prompt suivant indiquera encore ELIGIBLE_FOR_CTA: NO
-  }
+  // Server-side CTA hard lock remains (no state jump if not eligible)
+  // (We keep the step as computed; the next system prompt still enforces eligibility.)
 
   return new Response(rs, {
     headers: { 'x-next-state': JSON.stringify(state) }
