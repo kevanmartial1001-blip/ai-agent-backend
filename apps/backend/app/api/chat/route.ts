@@ -1,6 +1,6 @@
 /* app/api/chat/route.ts
    Conversational Flow Guard + KB-light enrichment + streaming
-   Enforces: country first; state only if USA; backchannel guidance; NO DEMO until all steps done.
+   Enforces: country first; state only if USA; NO DEMO until all steps done.
    Env: OPENAI_API_KEY, KB_BASE_URL (Apps Script / Web API)
 */
 export const runtime = 'edge';
@@ -211,10 +211,6 @@ HARD DEMO GUARD:
 - Do NOT mention or hint at a demo, trial, link, or booking until CURRENT STEP is CTA AND ELIGIBLE_FOR_CTA: YES.
 - If the user asks for a demo early: acknowledge positively and say you’ll set it up right after tailoring to their context, then continue the current step.
 
-BACKCHANNEL:
-- You may start ~30–60% of your turns with a short, varied acknowledgment (≤2 words), adapted to the user’s language.
-- Never repeat the same backchannel twice in a row. Skip it when a direct answer is better.
-
 INTRO MICRO-FLOW:
 - Turn 1: Ask ONLY “Could you introduce yourself—your name and what you do?”
 - Turn 2: Acknowledge their industry with ONE relatable pain and a friendly common-ground line. Then ask ONLY “Which country are you based in?”
@@ -322,9 +318,6 @@ export async function POST(req: Request) {
       }
     }
   });
-
-  // Server-side CTA hard lock remains (no state jump if not eligible)
-  // (We keep the step as computed; the next system prompt still enforces eligibility.)
 
   return new Response(rs, {
     headers: { 'x-next-state': JSON.stringify(state) }
